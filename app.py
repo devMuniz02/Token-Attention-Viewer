@@ -3,9 +3,9 @@
 Gradio word-level attention visualizer with:
 - Paragraph-style wrapping and semi-transparent backgrounds per word
 - Proper detokenization to words (regex)
-- Ability to pick from many causal LMs
 - Trailing EOS/PAD special tokens removed (no <|endoftext|> shown)
-- FIX: safely reset Radio with value=None to avoid Gradio choices error
+- Selection ONLY from generated words; prompt is hidden from selector
+- Viewer shows attention over BOTH prompt and generated words (context)
 """
 
 import re
@@ -136,26 +136,22 @@ def get_attention_for_token_layer(
 # =========================
 # Tokens -> words mapping
 # =========================
-def _words_and_map_from_tokens(gen_token_ids: List[int]) -> Tuple[List[str], List[int]]:
+def _words_and_map_from_tokens_simple(token_ids: List[int]) -> Tuple[List[str], List[int]]:
     """
-    From *generated* token ids, return:
-      - words: detokenized words (regex-split)
-      - word2tok: list where word2tok[i] = index (relative to generated) of the
-                  LAST token that composes that word.
+    Given token_ids (in-order), return:
+      - words: regex-split words from detokenized text
+      - word2tok: indices (relative to `token_ids`) of the LAST token composing each word
     """
-    if not gen_token_ids:
+    if not token_ids:
         return [], []
+    toks = tokenizer.convert_ids_to_tokens(token_ids)
+    detok = tokenizer.convert_tokens_to_string(toks)
+    words = WORD_RE.findall(detok)
 
-    gen_tokens_str = tokenizer.convert_ids_to_tokens(gen_token_ids)
-    detok_text = tokenizer.convert_tokens_to_string(gen_tokens_str)
-
-    words = WORD_RE.findall(detok_text)
-
-    enc = tokenizer(detok_text, return_offsets_mapping=True, add_special_tokens=False)
+    enc = tokenizer(detok, return_offsets_mapping=True, add_special_tokens=False)
     tok_offsets = enc["offset_mapping"]
-    n = min(len(tok_offsets), len(gen_token_ids))
-
-    spans = [m.span() for m in re.finditer(WORD_RE, detok_text)]
+    n = min(len(tok_offsets), len(token_ids))
+    spans = [m.span() for m in re.finditer(WORD_RE, detok)]
 
     word2tok: List[int] = []
     t = 0
@@ -174,12 +170,8 @@ def _words_and_map_from_tokens(gen_token_ids: List[int]) -> Tuple[List[str], Lis
         if last_t is None:
             last_t = max(0, min(n - 1, t - 1))
         word2tok.append(int(last_t))
-
     return words, word2tok
 
-# =========================
-# Helpers
-# =========================
 def _strip_trailing_special(ids: List[int]) -> List[int]:
     """Remove trailing EOS/PAD/other special tokens from the generated ids."""
     specials = set(getattr(tokenizer, "all_special_ids", []) or [])
@@ -188,23 +180,44 @@ def _strip_trailing_special(ids: List[int]) -> List[int]:
         j -= 1
     return ids[:j]
 
-def clamp01(x: float) -> float:
-    x = float(x)
-    return 0.0 if x < 0 else 1.0 if x > 1 else x
+def _words_and_maps_for_full_and_gen(all_token_ids: List[int], prompt_len: int):
+    """
+    Returns:
+      words_all: list[str]  (prompt + generated, in order)
+      abs_ends_all: list[int] absolute last-token index per word (over all_token_ids)
+      words_gen: list[str]  (generated only)
+      abs_ends_gen: list[int] absolute last-token index per generated word
+    """
+    if not all_token_ids:
+        return [], [], [], []
+
+    prompt_ids = all_token_ids[:prompt_len]
+    gen_ids = _strip_trailing_special(all_token_ids[prompt_len:])
+
+    p_words, p_map_rel = _words_and_map_from_tokens_simple(prompt_ids)
+    g_words, g_map_rel = _words_and_map_from_tokens_simple(gen_ids)
+
+    p_abs = [int(i) for i in p_map_rel]  # prompt starts at absolute 0
+    g_abs = [prompt_len + int(i) for i in g_map_rel]
+
+    words_all = p_words + g_words
+    abs_ends_all = p_abs + g_abs
+
+    return words_all, abs_ends_all, g_words, g_abs
 
 # =========================
 # Visualization (WORD-LEVEL)
 # =========================
-def generate_word_visualization(words: List[str],
-                                abs_word_ends: List[int],
+def generate_word_visualization(words_all: List[str],
+                                abs_word_ends_all: List[int],
                                 attention_values: np.ndarray,
                                 selected_token_abs_idx: int) -> str:
     """
-    Paragraph-style visualization over words.
+    Paragraph-style visualization over words (prompt + generated).
     For each word, aggregate attention over its composing tokens (sum),
     normalize across words, and render opacity as a semi-transparent background.
     """
-    if not words or attention_values is None or len(attention_values) == 0:
+    if not words_all or attention_values is None or len(attention_values) == 0:
         return (
             "<div style='width:100%;'>"
             "  <div style='background:#444;border:1px solid #eee;border-radius:8px;padding:10px;'>"
@@ -213,17 +226,17 @@ def generate_word_visualization(words: List[str],
             "</div>"
         )
 
-    # Start..end spans from ends
+    # Build word starts from ends (inclusive token indices)
     starts = []
-    for i, end in enumerate(abs_word_ends):
+    for i, end in enumerate(abs_word_ends_all):
         if i == 0:
             starts.append(0)
         else:
-            starts.append(min(abs_word_ends[i - 1] + 1, end))
+            starts.append(min(abs_word_ends_all[i - 1] + 1, end))
 
     # Sum attention per word
     word_scores = []
-    for i, end in enumerate(abs_word_ends):
+    for i, end in enumerate(abs_word_ends_all):
         start = starts[i]
         if start > end:
             start = end
@@ -237,15 +250,15 @@ def generate_word_visualization(words: List[str],
 
     # Which word holds the selected token?
     selected_word_idx = None
-    for i, end in enumerate(abs_word_ends):
+    for i, end in enumerate(abs_word_ends_all):
         if selected_token_abs_idx <= end:
             selected_word_idx = i
             break
-    if selected_word_idx is None and abs_word_ends:
-        selected_word_idx = len(abs_word_ends) - 1
+    if selected_word_idx is None and abs_word_ends_all:
+        selected_word_idx = len(abs_word_ends_all) - 1
 
     spans = []
-    for i, w in enumerate(words):
+    for i, w in enumerate(words_all):
         alpha = min(1.0, word_scores[i] / max_attn) if max_attn > 0 else 0.0
         bg = f"rgba(66,133,244,{alpha:.3f})"
         border = "2px solid #fff" if i == selected_word_idx else "1px solid transparent"
@@ -286,47 +299,50 @@ def run_generation(prompt, max_new_tokens, temperature, top_p):
         )
 
     all_token_ids = outputs.sequences[0].tolist()
-    generated_token_ids = _strip_trailing_special(all_token_ids[prompt_len:])
 
-    # Words and map (word -> last generated token index)
-    words, word2tok = _words_and_map_from_tokens(generated_token_ids)
+    # Build mappings for (prompt+generated) and for generated-only
+    words_all, abs_all, words_gen, abs_gen = _words_and_maps_for_full_and_gen(all_token_ids, prompt_len)
 
-    display_choices = [(w, i) for i, w in enumerate(words)]
+    # Radio choices: ONLY generated words
+    display_choices = [(w, i) for i, w in enumerate(words_gen)]
+
     if not display_choices:
         return {
             state_attentions: None,
             state_all_token_ids: None,
             state_prompt_len: 0,
-            state_words: None,
-            state_word2tok: None,
-            # SAFE RADIO RESET
+            state_words_all: None,
+            state_abs_all: None,
+            state_gen_abs: None,
             radio_word_selector: gr.update(choices=[], value=None),
-            html_visualization: "<div style='text-align:center;padding:20px;'>No new tokens generated.</div>",
+            html_visualization: "<div style='text-align:center;padding:20px;'>No generated tokens to visualize.</div>",
         }
 
-    first_word_idx = 0
+    first_gen_idx = 0
     html_init = update_visualization(
-        first_word_idx,
+        first_gen_idx,
         outputs.attentions,
         all_token_ids,
         prompt_len,
         0, 0, True, True,
-        words,
-        word2tok,
+        words_all,
+        abs_all,
+        abs_gen,  # map selector index -> absolute token end
     )
 
     return {
         state_attentions: outputs.attentions,
         state_all_token_ids: all_token_ids,
         state_prompt_len: prompt_len,
-        state_words: words,
-        state_word2tok: word2tok,
-        radio_word_selector: gr.update(choices=display_choices, value=first_word_idx),
+        state_words_all: words_all,
+        state_abs_all: abs_all,
+        state_gen_abs: abs_gen,
+        radio_word_selector: gr.update(choices=display_choices, value=first_gen_idx),
         html_visualization: html_init,
     }
 
 def update_visualization(
-    selected_word_index,
+    selected_gen_index,
     attentions,
     all_token_ids,
     prompt_len,
@@ -334,23 +350,31 @@ def update_visualization(
     head,
     mean_layers,
     mean_heads,
-    words,
-    word2tok,
+    words_all,
+    abs_all,
+    gen_abs_list,   # absolute last-token indices for generated words (selector domain)
 ):
-    """Recompute visualization for the chosen word (maps to its last token)."""
-    if selected_word_index is None or attentions is None or word2tok is None:
+    """Recompute visualization for the chosen GENERATED word, over full context."""
+    if selected_gen_index is None or attentions is None or gen_abs_list is None:
         return "<div style='text-align:center;padding:20px;'>Generate text first.</div>"
 
-    widx = int(selected_word_index)
-    if not (0 <= widx < len(word2tok)):
+    gidx = int(selected_gen_index)
+    if not (0 <= gidx < len(gen_abs_list)):
         return "<div style='text-align:center;padding:20px;'>Invalid selection.</div>"
 
-    token_index_relative = int(word2tok[widx])
-    token_index_absolute = int(prompt_len) + token_index_relative
+    token_index_abs = int(gen_abs_list[gidx])
+
+    # Map absolute generated index -> generation step
+    # step = abs_idx - prompt_len (clamped)
+    if len(attentions) == 0:
+        return "<div style='text-align:center;padding:20px;'>No attention steps available.</div>"
+
+    step_index = token_index_abs - prompt_len
+    step_index = max(0, min(step_index, len(attentions) - 1))
 
     token_attn = get_attention_for_token_layer(
         attentions,
-        token_index=token_index_relative,
+        token_index=step_index,              # index by generation step
         layer_index=int(layer),
         head_index=int(head),
         mean_across_layers=bool(mean_layers),
@@ -358,18 +382,18 @@ def update_visualization(
     )
 
     attn_vals = token_attn.detach().cpu().numpy()
-
-    # Pad attention to full (prompt + generated) length
-    total_tokens = len(all_token_ids)
-    padded = np.zeros(total_tokens, dtype=float)
     if attn_vals.ndim == 2:
         attn_vals = attn_vals[-1]
-    padded[: len(attn_vals)] = attn_vals
 
-    # Absolute word ends (prompt offset + relative token index)
-    abs_word_ends = [int(prompt_len) + int(t) for t in (word2tok or [])]
+    total_tokens = len(all_token_ids)
+    padded = np.zeros(total_tokens, dtype=float)
+    k_len = min(len(attn_vals), total_tokens)
+    padded[:k_len] = attn_vals[:k_len]
 
-    return generate_word_visualization(words, abs_word_ends, padded, token_index_absolute)
+    # Absolute word ends for FULL sequence (prompt + generated)
+    abs_word_ends = [int(i) for i in (abs_all or [])]
+
+    return generate_word_visualization(words_all, abs_word_ends, padded, token_index_abs)
 
 def toggle_slider(is_mean):
     return gr.update(interactive=not bool(is_mean))
@@ -380,8 +404,8 @@ def toggle_slider(is_mean):
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 🤖 Word-Level Attention Visualizer — choose a model & explore")
     gr.Markdown(
-        "Pick a model, generate text, then select a **generated word** to see where it attends. "
-        "Words wrap in a paragraph; opacity is the summed attention over the word’s tokens. "
+        "Generate text, then select a **generated word** to see where it attends. "
+        "The viewer below shows attention over both the **prompt** and the **generated** continuation. "
         "EOS tokens are stripped so `<|endoftext|>` doesn’t appear."
     )
 
@@ -389,8 +413,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     state_attentions = gr.State(None)
     state_all_token_ids = gr.State(None)
     state_prompt_len = gr.State(None)
-    state_words = gr.State(None)
-    state_word2tok = gr.State(None)
+    state_words_all = gr.State(None)   # full (prompt + gen) words
+    state_abs_all = gr.State(None)     # full abs ends
+    state_gen_abs = gr.State(None)     # generated-only abs ends
     state_model_name = gr.State(None)
 
     with gr.Row():
@@ -417,8 +442,8 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
         with gr.Column(scale=3):
             radio_word_selector = gr.Radio(
-                [], label="Select Generated Word to Visualize",
-                info="Click Generate to populate"
+                [], label="Select Generated Word",
+                info="Selector lists only generated words"
             )
             html_visualization = gr.HTML(
                 "<div style='text-align:center;padding:20px;color:#888;border:1px dashed #888;border-radius:8px;'>"
@@ -433,7 +458,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             selected_name,  # state_model_name
             gr.update(minimum=0, maximum=L - 1, value=0, interactive=not bool(mean_layers)),
             gr.update(minimum=0, maximum=H - 1, value=0, interactive=not bool(mean_heads)),
-            # SAFE RADIO RESET (avoid Value: [] not in choices)
+            # SAFE RADIO RESET
             gr.update(choices=[], value=None),
             "<div style='text-align:center;padding:20px;'>Model loaded. Generate to visualize.</div>",
         )
@@ -450,9 +475,8 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         L, H = model_heads_layers()
         return (
             ALLOWED_MODELS[0],
-            gr.update(minimum=0, maximum=L - 1, value=0, interactive=False if check_mean_layers.value else True),
-            gr.update(minimum=0, maximum=H - 1, value=0, interactive=False if check_mean_heads.value else True),
-            # Also ensure radio is clean at start
+            gr.update(minimum=0, maximum=L - 1, value=0, interactive=False),
+            gr.update(minimum=0, maximum=H - 1, value=0, interactive=False),
             gr.update(choices=[], value=None),
         )
     demo.load(_init_model, inputs=[gr.State(None)], outputs=[state_model_name, slider_layer, slider_head, radio_word_selector])
@@ -465,8 +489,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             state_attentions,
             state_all_token_ids,
             state_prompt_len,
-            state_words,
-            state_word2tok,
+            state_words_all,
+            state_abs_all,
+            state_gen_abs,
             radio_word_selector,
             html_visualization,
         ],
@@ -485,8 +510,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 slider_head,
                 check_mean_layers,
                 check_mean_heads,
-                state_words,
-                state_word2tok,
+                state_words_all,
+                state_abs_all,
+                state_gen_abs,
             ],
             outputs=html_visualization,
         )
@@ -497,6 +523,5 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
 if __name__ == "__main__":
     print(f"Device: {device}")
-    # Ensure a default model is ready
     load_model(ALLOWED_MODELS[0])
     demo.launch(debug=True)
